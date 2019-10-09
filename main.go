@@ -4,152 +4,40 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
 )
 
-type APIClient struct {
-	http.Client
-	BaseURL string
-}
-
-func NewAPIClient() *APIClient {
-	// TODO: add options
-	c := http.Client{
-		Timeout: 10 * time.Second,
-	}
-	return &APIClient{c, "https://rating.chgk.info/api"}
-}
-
-func (api APIClient) getURL(path string, items ...interface{}) string {
-	return api.BaseURL + fmt.Sprintf(path, items...)
-}
-
-func (api APIClient) prepareRequest(ctx context.Context, method, url string) (*http.Request, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	return req, nil
-}
-
-func (api APIClient) do(req *http.Request) (*http.Response, error) {
-	resp, err := api.Do(req)
-	if err != nil {
-		log.Printf("--> %s %s Error: %s", req.Method, req.URL.Path, err)
-	} else {
-		log.Printf("--> %s %s %d", req.Method, req.URL.Path, resp.StatusCode)
-	}
-	return resp, err
-}
-
-func (api APIClient) getPlayerTournaments(ctx context.Context, pID string) ([]byte, error) {
-	url := api.getURL("/players/%s/tournaments.json", pID)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	req, err := api.prepareRequest(ctx, http.MethodGet, url)
-	if err != nil {
-		log.Println("Error creating player tournaments request", err)
-		return nil, err
-	}
-
-	resp, err := api.do(req)
-	if err != nil {
-		log.Println("Error retrieving player tournaments", err)
-		return nil, err
-	}
-
-	tb, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Println("Error reading tournaments response", err)
-		return nil, err
-	}
-	return tb, nil
-}
-
-func (api APIClient) getTournamentPlayers(ctx context.Context, tID, teamID string) ([]byte, error) {
-	url := api.getURL("/tournaments/%s/recaps/%s.json", tID, teamID)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	req, err := api.prepareRequest(ctx, http.MethodGet, url)
-	if err != nil {
-		log.Println("Error creating tournaments players request", err)
-		return nil, err
-	}
-
-	resp, err := api.do(req)
-	if err != nil {
-		log.Println("Error retrieving players for tournament", err)
-		return nil, err
-	}
-
-	pb, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Println("Error reading players for tournament", err)
-		return nil, err
-	}
-	return pb, nil
-}
-
-func (api APIClient) getPlayerInfo(ctx context.Context, pID string) ([]byte, error) {
-	url := api.getURL("/players/%s.json", pID)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	req, err := api.prepareRequest(ctx, http.MethodGet, url)
-	if err != nil {
-		log.Println("Error creating player info request", err)
-		return nil, err
-	}
-
-	resp, err := api.do(req)
-	if err != nil {
-		log.Println("Error retrieving player info", err)
-		return nil, err
-	}
-
-	pb, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Println("Error reading player info", err)
-		return nil, err
-	}
-	return pb, nil
+type TWorkerPayload struct {
+	ctx context.Context
+	wg  *sync.WaitGroup
+	in  chan Tournament
+	out chan []string
 }
 
 type TWorker struct {
 	client *APIClient
-	ctx    context.Context
-	in     chan Tournament
-	out    chan []string
-}
-
-func (w *TWorker) send(t Tournament) {
-	w.in <- t
-}
-
-func (w *TWorker) receive() []string {
-	return <-w.out
+	in     chan *TWorkerPayload
 }
 
 func (w *TWorker) process() {
-	for item := range w.in {
-		w.out <- w.getData(item)
+	for p := range w.in {
+		for item := range p.in {
+			p.out <- w.getData(p.ctx, item)
+		}
+		p.wg.Done()
 	}
-	close(w.out)
 }
 
-func (w *TWorker) getData(t Tournament) []string {
-	resp, err := w.client.getTournamentPlayers(w.ctx, t.IDTournament, t.IDTeam)
+func (w *TWorker) getData(ctx context.Context, t Tournament) []string {
+	resp, err := w.client.getTournamentPlayers(ctx, t.IDTournament, t.IDTeam)
 	if err != nil {
 		log.Println("Error getting players for tournament", err)
 		return nil
@@ -168,31 +56,74 @@ func (w *TWorker) getData(t Tournament) []string {
 	return players
 }
 
+type TWorkerPool struct {
+	nworkers int
+	workers  []TWorker
+
+	in chan *TWorkerPayload
+}
+
+func setupTWorkerPool(nworkers int, c *APIClient) TWorkerPool {
+	in := make(chan *TWorkerPayload, nworkers)
+	workers := make([]TWorker, nworkers)
+	for i := 0; i < nworkers; i++ {
+		workers[i] = TWorker{c, in}
+		go workers[i].process()
+	}
+
+	return TWorkerPool{nworkers, workers, in}
+}
+
+func (twp *TWorkerPool) send(ctx context.Context, tt []Tournament) <-chan []string {
+	in := make(chan Tournament, twp.nworkers)
+	out := make(chan []string, twp.nworkers)
+	wg := &sync.WaitGroup{}
+	// Run task on multiple workers
+	for i := 0; i < twp.nworkers; i++ {
+		wg.Add(1)
+		twp.in <- &TWorkerPayload{ctx, wg, in, out}
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	go func() {
+		for _, t := range tt {
+			in <- t
+		}
+		close(in)
+	}()
+
+	return out
+}
+
+type PWorkerPayload struct {
+	ctx context.Context
+	wg  *sync.WaitGroup
+	in  chan string
+	out chan *Player
+}
+
 type PWorker struct {
 	client *APIClient
-	ctx    context.Context
-	in     chan string
-	out    chan *Player
-}
-
-func (w *PWorker) send(s string) {
-	w.in <- s
-}
-
-func (w *PWorker) receive() *Player {
-	return <-w.out
+	in     chan *PWorkerPayload
 }
 
 func (w PWorker) process() {
-	for item := range w.in {
-		// TODO: search in cache
-		w.out <- w.getPlayerInfo(item)
+	for p := range w.in {
+		for item := range p.in {
+			// TODO: search in cache
+			p.out <- w.getPlayerInfo(p.ctx, item)
+		}
+		p.wg.Done()
 	}
-	close(w.out)
+
 }
 
-func (w PWorker) getPlayerInfo(pID string) *Player {
-	resp, err := w.client.getPlayerInfo(w.ctx, pID)
+func (w PWorker) getPlayerInfo(ctx context.Context, pID string) *Player {
+	resp, err := w.client.getPlayerInfo(ctx, pID)
 	if err != nil {
 		log.Println("Error getting player data", err)
 		return nil
@@ -205,6 +136,49 @@ func (w PWorker) getPlayerInfo(pID string) *Player {
 		return nil
 	}
 	return &pl[0]
+}
+
+type PWorkerPool struct {
+	nworkers int
+	workers  []PWorker
+
+	in chan *PWorkerPayload
+}
+
+func setupPWorkerPool(nworkers int, c *APIClient) PWorkerPool {
+	in := make(chan *PWorkerPayload, nworkers)
+	workers := make([]PWorker, nworkers)
+	for i := 0; i < nworkers; i++ {
+		workers[i] = PWorker{c, in}
+		go workers[i].process()
+	}
+
+	return PWorkerPool{nworkers, workers, in}
+}
+
+func (pwp *PWorkerPool) send(ctx context.Context, players []string) <-chan *Player {
+	in := make(chan string, pwp.nworkers)
+	out := make(chan *Player, pwp.nworkers)
+	wg := &sync.WaitGroup{}
+	// Run task on multiple workers
+	for i := 0; i < pwp.nworkers; i++ {
+		wg.Add(1)
+		pwp.in <- &PWorkerPayload{ctx, wg, in, out}
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	go func() {
+		for _, p := range players {
+			in <- p
+		}
+		close(in)
+	}()
+
+	return out
 }
 
 // TODO: add cache
@@ -223,9 +197,6 @@ type Season struct {
 type Server struct {
 	*http.Server
 	API *APIClient
-
-	TWorkers []TWorker
-	PWorkers []PWorker
 
 	done chan bool
 }
@@ -264,14 +235,11 @@ func (s *Server) getPlayerTournaments(ctx context.Context, pID string) ([]Tourna
 }
 
 func (s *Server) getPlayerComrades(ctx context.Context, pID string, tournaments []Tournament) map[string]int {
+	wp := setupTWorkerPool(3, s.API)
 	comrades := make(map[string]int)
-	in := make(chan Tournament, 2)
-	out := make(chan []string, 2)
-	tworker := TWorker{client: s.API, ctx: ctx, in: in, out: out}
-	go tworker.process()
-	for _, t := range tournaments {
-		tworker.send(t)
-		for _, p := range tworker.receive() {
+	out := wp.send(ctx, tournaments)
+	for pl := range out {
+		for _, p := range pl {
 			// Skip current player
 			if p == pID {
 				continue
@@ -279,26 +247,24 @@ func (s *Server) getPlayerComrades(ctx context.Context, pID string, tournaments 
 			comrades[p]++
 		}
 	}
-	close(in)
 	return comrades
 }
 
 func (s *Server) getPlayerComradesInfo(ctx context.Context, comrades map[string]int) []Player {
+	wp := setupPWorkerPool(3, s.API)
+	pp := make([]string, 0)
+	for id := range comrades {
+		pp = append(pp, id)
+	}
+	out := wp.send(ctx, pp)
 	var players []Player
-	in := make(chan string, 1)
-	out := make(chan *Player, 1)
-	pworker := PWorker{client: s.API, ctx: ctx, in: in, out: out}
-	go pworker.process()
 
-	for id, count := range comrades {
-		pworker.send(id)
-		pl := pworker.receive()
+	for pl := range out {
 		if pl != nil {
-			pl.Games = count
+			pl.Games = comrades[pl.IDplayer]
 			players = append(players, *pl)
 		}
 	}
-	close(in)
 	return players
 }
 
