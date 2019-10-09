@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+
+	"github.com/go-redis/redis"
 )
 
 type TWorkerPayload struct {
@@ -198,6 +200,8 @@ type Server struct {
 	*http.Server
 	API *APIClient
 
+	rcl *redis.Client
+
 	done chan bool
 }
 
@@ -209,7 +213,16 @@ func NewServer(port int, router *http.ServeMux) *Server {
 		ReadTimeout:  20 * time.Second,
 		WriteTimeout: 20 * time.Second,
 	}
-	return &Server{Server: s, API: NewAPIClient(), done: make(chan bool)}
+	rcl := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+	_, err := rcl.Ping().Result()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return &Server{Server: s, API: NewAPIClient(), rcl: rcl, done: make(chan bool)}
 
 }
 
@@ -235,7 +248,7 @@ func (s *Server) getPlayerTournaments(ctx context.Context, pID string) ([]Tourna
 }
 
 func (s *Server) getPlayerComrades(ctx context.Context, pID string, tournaments []Tournament) map[string]int {
-	wp := setupTWorkerPool(3, s.API)
+	wp := setupTWorkerPool(4, s.API)
 	comrades := make(map[string]int)
 	out := wp.send(ctx, tournaments)
 	for pl := range out {
@@ -251,18 +264,41 @@ func (s *Server) getPlayerComrades(ctx context.Context, pID string, tournaments 
 }
 
 func (s *Server) getPlayerComradesInfo(ctx context.Context, comrades map[string]int) []Player {
-	wp := setupPWorkerPool(3, s.API)
-	pp := make([]string, 0)
+	wp := setupPWorkerPool(4, s.API)
+	var pp []string
+	var players []Player
+
 	for id := range comrades {
-		pp = append(pp, id)
+		val, err := s.rcl.Get(id).Bytes()
+		if err != nil {
+			pp = append(pp, id)
+		} else {
+			log.Println("Hit for player", id)
+			var pl Player
+			err := json.Unmarshal(val, &pl)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			players = append(players, pl)
+		}
 	}
 	out := wp.send(ctx, pp)
-	var players []Player
 
 	for pl := range out {
 		if pl != nil {
 			pl.Games = comrades[pl.IDplayer]
 			players = append(players, *pl)
+			bt, err := json.Marshal(pl)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			err = s.rcl.Set(pl.IDplayer, bt, time.Hour).Err()
+			if err != nil {
+				log.Println(err)
+				continue
+			}
 		}
 	}
 	return players
