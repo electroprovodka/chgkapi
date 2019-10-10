@@ -2,41 +2,82 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 )
 
 type APIClient struct {
-	http.Client
-	BaseURL string
+	BaseURL   *url.URL
+	UserAgent string
+
+	httpClient *http.Client
 }
 
-func NewAPIClient() *APIClient {
+type Option func(*APIClient)
+
+func UserAgent(ua string) Option {
+	return func(c *APIClient) {
+		c.UserAgent = ua
+	}
+}
+
+func BaseUrl(url *url.URL) Option {
+	return func(c *APIClient) {
+		c.BaseURL = url
+	}
+}
+
+func Timeout(t time.Duration) Option {
+	return func(c *APIClient) {
+		c.httpClient.Timeout = t
+	}
+}
+
+func NewAPIClient(options ...Option) *APIClient {
 	// TODO: add options
-	c := http.Client{
+	c := &http.Client{
 		Timeout: 10 * time.Second,
 	}
-	return &APIClient{c, "https://rating.chgk.info/api"}
+
+	api := &APIClient{httpClient: c}
+
+	for _, opt := range options {
+		opt(api)
+	}
+
+	if api.BaseURL == nil {
+		url, err := url.Parse("https://rating.chgk.info/")
+		if err != nil {
+			log.Fatal("Invalid base url.")
+		}
+		api.BaseURL = url
+	}
+
+	return api
 }
 
-func (api APIClient) getURL(path string, items ...interface{}) string {
-	return api.BaseURL + fmt.Sprintf(path, items...)
+func (api APIClient) getURL(path string, items ...interface{}) *url.URL {
+	rel := &url.URL{Path: fmt.Sprintf(path, items...)}
+	return api.BaseURL.ResolveReference(rel)
 }
 
-func (api APIClient) prepareRequest(ctx context.Context, method, url string) (*http.Request, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func (api APIClient) prepareRequest(ctx context.Context, method string, url *url.URL) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodGet, url.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 	req = req.WithContext(ctx)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", api.UserAgent)
 	return req, nil
 }
 
 func (api APIClient) do(req *http.Request) (*http.Response, error) {
-	resp, err := api.Do(req)
+	resp, err := api.httpClient.Do(req)
 	if err != nil {
 		log.Printf("--> %s %s Error: %s", req.Method, req.URL.Path, err)
 		return nil, err
@@ -50,8 +91,8 @@ func (api APIClient) do(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-func (api APIClient) getPlayerTournaments(ctx context.Context, pID string) ([]byte, error) {
-	url := api.getURL("/players/%s/tournaments.json", pID)
+func (api APIClient) ListPlayerTournaments(ctx context.Context, pID string) ([]Tournament, error) {
+	url := api.getURL("api/players/%s/tournaments.json", pID)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -66,17 +107,23 @@ func (api APIClient) getPlayerTournaments(ctx context.Context, pID string) ([]by
 		log.Println("Error retrieving player tournaments", err)
 		return nil, err
 	}
+	defer resp.Body.Close()
 
-	tb, err := ioutil.ReadAll(resp.Body)
+	var seasons map[string]Season
+	err = json.NewDecoder(resp.Body).Decode(&seasons)
 	if err != nil {
-		log.Println("Error reading tournaments response", err)
 		return nil, err
 	}
-	return tb, nil
+
+	var tournaments []Tournament
+	for _, s := range seasons {
+		tournaments = append(tournaments, s.Tournaments...)
+	}
+	return tournaments, err
 }
 
-func (api APIClient) getTournamentPlayers(ctx context.Context, tID, teamID string) ([]byte, error) {
-	url := api.getURL("/tournaments/%s/recaps/%s.json", tID, teamID)
+func (api APIClient) ListTournamentPlayers(ctx context.Context, tID, teamID string) ([]string, error) {
+	url := api.getURL("api/tournaments/%s/recaps/%s.json", tID, teamID)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -91,17 +138,23 @@ func (api APIClient) getTournamentPlayers(ctx context.Context, tID, teamID strin
 		log.Println("Error retrieving players for tournament", err)
 		return nil, err
 	}
+	defer resp.Body.Close()
 
-	pb, err := ioutil.ReadAll(resp.Body)
+	var td []map[string]string
+	err = json.NewDecoder(resp.Body).Decode(&td)
 	if err != nil {
-		log.Println("Error reading players for tournament", err)
 		return nil, err
 	}
-	return pb, nil
+
+	players := make([]string, len(td))
+	for i, pl := range td {
+		players[i] = pl["idplayer"]
+	}
+	return players, nil
 }
 
-func (api APIClient) getPlayerInfo(ctx context.Context, pID string) ([]byte, error) {
-	url := api.getURL("/players/%s.json", pID)
+func (api APIClient) PlayerInfo(ctx context.Context, pID string) (*Player, error) {
+	url := api.getURL("api/players/%s.json", pID)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -117,10 +170,11 @@ func (api APIClient) getPlayerInfo(ctx context.Context, pID string) ([]byte, err
 		return nil, err
 	}
 
-	pb, err := ioutil.ReadAll(resp.Body)
+	var pl []Player
+	err = json.NewDecoder(resp.Body).Decode(&pl)
 	if err != nil {
-		log.Println("Error reading player info", err)
+		log.Println("Error parsing player data", err)
 		return nil, err
 	}
-	return pb, nil
+	return &pl[0], nil
 }

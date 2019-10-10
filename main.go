@@ -32,7 +32,7 @@ func (w *TWorker) process() {
 			select {
 			case <-p.ctx.Done():
 				break processLoop
-			case p.out <- w.getData(p.ctx, item):
+			case p.out <- w.getPlayersIDs(p.ctx, item):
 				break
 			}
 		}
@@ -40,22 +40,11 @@ func (w *TWorker) process() {
 	}
 }
 
-func (w *TWorker) getData(ctx context.Context, t Tournament) []string {
-	resp, err := w.client.getTournamentPlayers(ctx, t.IDTournament, t.IDTeam)
+func (w *TWorker) getPlayersIDs(ctx context.Context, t Tournament) []string {
+	players, err := w.client.ListTournamentPlayers(ctx, t.IDTournament, t.IDTeam)
 	if err != nil {
 		log.Println("Error getting players for tournament", err)
 		return nil
-	}
-
-	var td []map[string]string
-	err = json.Unmarshal(resp, &td)
-	if err != nil {
-		log.Println("Error parsing players for tournament", err)
-		return nil
-	}
-	players := make([]string, len(td))
-	for i, pl := range td {
-		players[i] = pl["idplayer"]
 	}
 	return players
 }
@@ -112,7 +101,7 @@ func (w PWorker) process() {
 			select {
 			case <-p.ctx.Done():
 				break processLoop
-			case p.out <- w.getPlayerInfo(p.ctx, item):
+			case p.out <- w.getPlayer(p.ctx, item):
 				break
 			}
 		}
@@ -121,20 +110,13 @@ func (w PWorker) process() {
 
 }
 
-func (w PWorker) getPlayerInfo(ctx context.Context, pID string) *Player {
-	resp, err := w.client.getPlayerInfo(ctx, pID)
+func (w PWorker) getPlayer(ctx context.Context, pID string) *Player {
+	player, err := w.client.PlayerInfo(ctx, pID)
 	if err != nil {
 		log.Println("Error getting player data", err)
 		return nil
 	}
-
-	var pl []Player
-	err = json.Unmarshal(resp, &pl)
-	if err != nil {
-		log.Println("Error parsing player data", err)
-		return nil
-	}
-	return &pl[0]
+	return player
 }
 
 type PWorkerPool struct {
@@ -211,27 +193,6 @@ func NewServer(port int, router *http.ServeMux) *Server {
 
 }
 
-func (s *Server) getPlayerTournaments(ctx context.Context, pID string) ([]Tournament, error) {
-	resp, err := s.API.getPlayerTournaments(ctx, pID)
-	if err != nil {
-		log.Println("Error getting player tournaments", err)
-		return nil, err
-	}
-
-	var seasons map[string]Season
-	err = json.Unmarshal(resp, &seasons)
-	if err != nil {
-		log.Println("Error parsing tournaments response", err)
-		return nil, err
-	}
-
-	var tournaments []Tournament
-	for _, s := range seasons {
-		tournaments = append(tournaments, s.Tournaments...)
-	}
-	return tournaments, nil
-}
-
 func (s *Server) getPlayerComrades(ctx context.Context, pID string, tournaments []Tournament) map[string]int {
 	out := s.twp.send(ctx, tournaments)
 
@@ -270,7 +231,7 @@ func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	pID := vars["id"]
 	ctx := r.Context()
-	tournaments, err := s.getPlayerTournaments(ctx, pID)
+	tournaments, err := s.API.ListPlayerTournaments(ctx, pID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
