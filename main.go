@@ -32,7 +32,7 @@ func (w *TWorker) process() {
 			select {
 			case <-p.ctx.Done():
 				break processLoop
-			case p.out <- w.getData(p.ctx, item):
+			case p.out <- w.getPlayersIDs(p.ctx, item):
 				break
 			}
 		}
@@ -40,7 +40,7 @@ func (w *TWorker) process() {
 	}
 }
 
-func (w *TWorker) getData(ctx context.Context, t Tournament) []string {
+func (w *TWorker) getPlayersIDs(ctx context.Context, t Tournament) []string {
 	players, err := w.client.ListTournamentPlayers(ctx, t.IDTournament, t.IDTeam)
 	if err != nil {
 		log.Println("Error getting players for tournament", err)
@@ -101,7 +101,7 @@ func (w PWorker) process() {
 			select {
 			case <-p.ctx.Done():
 				break processLoop
-			case p.out <- w.getPlayerInfo(p.ctx, item):
+			case p.out <- w.getPlayer(p.ctx, item):
 				break
 			}
 		}
@@ -110,13 +110,12 @@ func (w PWorker) process() {
 
 }
 
-func (w PWorker) getPlayerInfo(ctx context.Context, pID string) *Player {
+func (w PWorker) getPlayer(ctx context.Context, pID string) *Player {
 	player, err := w.client.PlayerInfo(ctx, pID)
 	if err != nil {
 		log.Println("Error getting player data", err)
 		return nil
 	}
-
 	return player
 }
 
