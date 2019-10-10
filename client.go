@@ -39,14 +39,15 @@ func (api APIClient) do(req *http.Request) (*http.Response, error) {
 	resp, err := api.Do(req)
 	if err != nil {
 		log.Printf("--> %s %s Error: %s", req.Method, req.URL.Path, err)
-	} else {
-		log.Printf("--> %s %s %d", req.Method, req.URL.Path, resp.StatusCode)
+		return nil, err
 	}
+
+	log.Printf("--> %s %s %d", req.Method, req.URL.Path, resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("Response code %d", resp.StatusCode)
 	}
-	return resp, err
+	return resp, nil
 }
 
 func (api APIClient) getPlayerTournaments(ctx context.Context, pID string) ([]byte, error) {

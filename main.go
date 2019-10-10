@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -17,7 +16,6 @@ import (
 
 type TWorkerPayload struct {
 	ctx context.Context
-	wg  *sync.WaitGroup
 	in  chan Tournament
 	out chan []string
 }
@@ -29,10 +27,16 @@ type TWorker struct {
 
 func (w *TWorker) process() {
 	for p := range w.in {
+	processLoop:
 		for item := range p.in {
-			p.out <- w.getData(p.ctx, item)
+			select {
+			case <-p.ctx.Done():
+				break processLoop
+			case p.out <- w.getData(p.ctx, item):
+				break
+			}
 		}
-		p.wg.Done()
+		close(p.out)
 	}
 }
 
@@ -63,7 +67,7 @@ type TWorkerPool struct {
 	in chan *TWorkerPayload
 }
 
-func setupTWorkerPool(nworkers int, c *APIClient) TWorkerPool {
+func setupTWorkerPool(nworkers int, c *APIClient) *TWorkerPool {
 	in := make(chan *TWorkerPayload, nworkers)
 	workers := make([]TWorker, nworkers)
 	for i := 0; i < nworkers; i++ {
@@ -71,23 +75,13 @@ func setupTWorkerPool(nworkers int, c *APIClient) TWorkerPool {
 		go workers[i].process()
 	}
 
-	return TWorkerPool{nworkers, workers, in}
+	return &TWorkerPool{nworkers, workers, in}
 }
 
 func (twp *TWorkerPool) send(ctx context.Context, tt []Tournament) <-chan []string {
 	in := make(chan Tournament, twp.nworkers)
 	out := make(chan []string, twp.nworkers)
-	wg := &sync.WaitGroup{}
-	// Run task on multiple workers
-	for i := 0; i < twp.nworkers; i++ {
-		wg.Add(1)
-		twp.in <- &TWorkerPayload{ctx, wg, in, out}
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
+	twp.in <- &TWorkerPayload{ctx, in, out}
 
 	go func() {
 		for _, t := range tt {
@@ -101,7 +95,6 @@ func (twp *TWorkerPool) send(ctx context.Context, tt []Tournament) <-chan []stri
 
 type PWorkerPayload struct {
 	ctx context.Context
-	wg  *sync.WaitGroup
 	in  chan string
 	out chan *Player
 }
@@ -113,11 +106,17 @@ type PWorker struct {
 
 func (w PWorker) process() {
 	for p := range w.in {
+	processLoop:
 		for item := range p.in {
 			// TODO: search in cache
-			p.out <- w.getPlayerInfo(p.ctx, item)
+			select {
+			case <-p.ctx.Done():
+				break processLoop
+			case p.out <- w.getPlayerInfo(p.ctx, item):
+				break
+			}
 		}
-		p.wg.Done()
+		close(p.out)
 	}
 
 }
@@ -145,7 +144,7 @@ type PWorkerPool struct {
 	in chan *PWorkerPayload
 }
 
-func setupPWorkerPool(nworkers int, c *APIClient) PWorkerPool {
+func setupPWorkerPool(nworkers int, c *APIClient) *PWorkerPool {
 	in := make(chan *PWorkerPayload, nworkers)
 	workers := make([]PWorker, nworkers)
 	for i := 0; i < nworkers; i++ {
@@ -153,23 +152,14 @@ func setupPWorkerPool(nworkers int, c *APIClient) PWorkerPool {
 		go workers[i].process()
 	}
 
-	return PWorkerPool{nworkers, workers, in}
+	return &PWorkerPool{nworkers, workers, in}
 }
 
 func (pwp *PWorkerPool) send(ctx context.Context, players []string) <-chan *Player {
 	in := make(chan string, pwp.nworkers)
 	out := make(chan *Player, pwp.nworkers)
-	wg := &sync.WaitGroup{}
-	// Run task on multiple workers
-	for i := 0; i < pwp.nworkers; i++ {
-		wg.Add(1)
-		pwp.in <- &PWorkerPayload{ctx, wg, in, out}
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
+	// TODO: Run task on multiple workers? Or set one tasks set for each worker?
+	pwp.in <- &PWorkerPayload{ctx, in, out}
 
 	go func() {
 		for _, p := range players {
@@ -180,6 +170,10 @@ func (pwp *PWorkerPool) send(ctx context.Context, players []string) <-chan *Play
 
 	return out
 }
+
+// func (pwp *PWorkerPool) stop() {
+// 	close(pwp.in)
+// }
 
 // TODO: add cache
 // TODO: add workers
@@ -198,6 +192,9 @@ type Server struct {
 	*http.Server
 	API *APIClient
 
+	twp *TWorkerPool
+	pwp *PWorkerPool
+
 	done chan bool
 }
 
@@ -209,7 +206,8 @@ func NewServer(port int, router *http.ServeMux) *Server {
 		ReadTimeout:  20 * time.Second,
 		WriteTimeout: 20 * time.Second,
 	}
-	return &Server{Server: s, API: NewAPIClient(), done: make(chan bool)}
+	api := NewAPIClient()
+	return &Server{Server: s, API: api, done: make(chan bool), twp: setupTWorkerPool(3, api), pwp: setupPWorkerPool(3, api)}
 
 }
 
@@ -235,9 +233,9 @@ func (s *Server) getPlayerTournaments(ctx context.Context, pID string) ([]Tourna
 }
 
 func (s *Server) getPlayerComrades(ctx context.Context, pID string, tournaments []Tournament) map[string]int {
-	wp := setupTWorkerPool(3, s.API)
+	out := s.twp.send(ctx, tournaments)
+
 	comrades := make(map[string]int)
-	out := wp.send(ctx, tournaments)
 	for pl := range out {
 		for _, p := range pl {
 			// Skip current player
@@ -251,14 +249,14 @@ func (s *Server) getPlayerComrades(ctx context.Context, pID string, tournaments 
 }
 
 func (s *Server) getPlayerComradesInfo(ctx context.Context, comrades map[string]int) []Player {
-	wp := setupPWorkerPool(3, s.API)
 	pp := make([]string, 0)
 	for id := range comrades {
 		pp = append(pp, id)
 	}
-	out := wp.send(ctx, pp)
-	var players []Player
 
+	out := s.pwp.send(ctx, pp)
+
+	var players []Player
 	for pl := range out {
 		if pl != nil {
 			pl.Games = comrades[pl.IDplayer]
