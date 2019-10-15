@@ -162,14 +162,6 @@ func (pwp *PWorkerPool) send(ctx context.Context, players []string) <-chan *Play
 // TODO: add routing
 // TODO: add logging
 
-type Tournament struct {
-	IDTournament, IDTeam string
-}
-
-type Season struct {
-	Tournaments []Tournament
-}
-
 type Server struct {
 	*http.Server
 	API *APIClient
@@ -189,12 +181,12 @@ func NewServer(port int, router *http.ServeMux) *Server {
 		WriteTimeout: 20 * time.Second,
 	}
 	api := NewAPIClient()
-	return &Server{Server: s, API: api, done: make(chan bool), twp: setupTWorkerPool(3, api), pwp: setupPWorkerPool(3, api)}
+	return &Server{Server: s, API: api, done: make(chan bool), twp: setupTWorkerPool(5, api), pwp: setupPWorkerPool(5, api)}
 
 }
 
-func (s *Server) getPlayerComrades(ctx context.Context, pID string, tournaments []Tournament) map[string]int {
-	out := s.twp.send(ctx, tournaments)
+func getPlayerComrades(ctx context.Context, twp *TWorkerPool, pID string, tournaments []Tournament) map[string]int {
+	out := twp.send(ctx, tournaments)
 
 	comrades := make(map[string]int)
 	for pl := range out {
@@ -209,13 +201,13 @@ func (s *Server) getPlayerComrades(ctx context.Context, pID string, tournaments 
 	return comrades
 }
 
-func (s *Server) getPlayerComradesInfo(ctx context.Context, comrades map[string]int) []Player {
+func getPlayerComradesInfo(ctx context.Context, pwp *PWorkerPool, comrades map[string]int) []Player {
 	pp := make([]string, 0)
 	for id := range comrades {
 		pp = append(pp, id)
 	}
 
-	out := s.pwp.send(ctx, pp)
+	out := pwp.send(ctx, pp)
 
 	var players []Player
 	for pl := range out {
@@ -237,8 +229,8 @@ func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	comrades := s.getPlayerComrades(ctx, pID, tournaments)
-	players := s.getPlayerComradesInfo(ctx, comrades)
+	comrades := getPlayerComrades(ctx, s.twp, pID, tournaments)
+	players := getPlayerComradesInfo(ctx, s.pwp, comrades)
 
 	OrderBy(gamesSort, nameSort, surnameSort, patronymicSort).Sort(players)
 
@@ -277,7 +269,6 @@ func (s *Server) Start() {
 	if err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Unexpected server error: %s\n", err)
 	}
-
 	// Wait until shutdown is finished
 	<-s.done
 }

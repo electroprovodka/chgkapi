@@ -64,3 +64,11 @@ func (ps PlayerSorter) Less(i, j int) bool {
 	}
 	return ps.less[k](p, q)
 }
+
+type Tournament struct {
+	IDTournament, IDTeam string
+}
+
+type Season struct {
+	Tournaments []Tournament
+}

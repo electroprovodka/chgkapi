@@ -52,7 +52,7 @@ func NewAPIClient(options ...Option) *APIClient {
 	if api.BaseURL == nil {
 		url, err := url.Parse("https://rating.chgk.info/")
 		if err != nil {
-			log.Fatal("Invalid base url.")
+			log.Fatal("Invalid base url")
 		}
 		api.BaseURL = url
 	}
